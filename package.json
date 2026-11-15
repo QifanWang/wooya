@@ -1,0 +1,30 @@
+{
+  "name": "wooya",
+  "version": "0.1.0",
+  "description": "Personal learning agent: ingest sources locally, dual-track answers, Socratic learning records.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "wooya": "dist/cli.js"
+  },
+  "main": "dist/cli.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "openai": "^7.57.0"
+  }
+}
