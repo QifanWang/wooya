@@ -61,22 +61,109 @@ export function createClient(cfg: WooyaConfig): OpenAI {
   });
 }
 
+export interface ChatOptions {
+  /** 流式回调：模型正文增量到达时逐段触发（仅 content，不含工具调用） */
+  onDelta?: (delta: string) => void;
+}
+
 export async function chatCompletion(
   cfg: WooyaConfig,
   messages: ChatMessage[],
   tools: ToolDefinition[],
+  opts: ChatOptions = {},
 ): Promise<LlmResult> {
   const client = createClient(cfg);
-  const params: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
+  const base: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
     model: cfg.model,
     messages: toApiMessages(messages),
     max_tokens: cfg.maxTokens,
     ...(tools.length ? { tools: toApiTools(tools) } : {}),
   };
-  const res = await client.chat.completions.create(params);
-  const msg = res.choices[0]?.message;
 
-  const toolCalls: ToolCall[] = (msg?.tool_calls ?? [])
+  if (!opts.onDelta) {
+    const res = await client.chat.completions.create(base);
+    return toResult(
+      res.choices[0]?.message?.content ?? null,
+      parseToolCalls(res.choices[0]?.message?.tool_calls ?? []),
+      res.choices[0]?.finish_reason,
+      res.usage?.prompt_tokens,
+      res.usage?.completion_tokens,
+    );
+  }
+
+  const stream = await createStream(client, base);
+  let content = '';
+  let finishReason: string | undefined;
+  let promptTokens: number | undefined;
+  let completionTokens: number | undefined;
+  // index → 累积中的工具调用（流式下 id/name/arguments 分片到达）
+  const pending = new Map<number, { id?: string; name?: string; args: string }>();
+
+  for await (const chunk of stream) {
+    if (chunk.usage) {
+      promptTokens = chunk.usage.prompt_tokens;
+      completionTokens = chunk.usage.completion_tokens;
+    }
+    const choice = chunk.choices?.[0];
+    if (!choice) continue;
+    const delta = choice.delta;
+    if (delta?.content) {
+      content += delta.content;
+      opts.onDelta(delta.content);
+    }
+    for (const tc of delta?.tool_calls ?? []) {
+      const slot = pending.get(tc.index) ?? { args: '' };
+      if (tc.id) slot.id = tc.id;
+      if (tc.function?.name) slot.name = tc.function.name;
+      if (tc.function?.arguments) slot.args += tc.function.arguments;
+      pending.set(tc.index, slot);
+    }
+    if (choice.finish_reason) finishReason = choice.finish_reason;
+  }
+
+  const toolCalls: ToolCall[] = [...pending.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([idx, slot]) => {
+      let args: Record<string, unknown> = {};
+      try {
+        args = JSON.parse(slot.args || '{}') as Record<string, unknown>;
+      } catch {
+        args = { _raw: slot.args };
+      }
+      return {
+        id: slot.id ?? `call_${idx}`,
+        type: 'function' as const,
+        function: { name: slot.name ?? '', args },
+      };
+    });
+
+  return toResult(content ? stripThink(content) : null, toolCalls, finishReason, promptTokens, completionTokens);
+}
+
+async function createStream(
+  client: OpenAI,
+  base: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
+): Promise<AsyncIterable<OpenAI.Chat.ChatCompletionChunk>> {
+  try {
+    return await client.chat.completions.create({
+      ...base,
+      stream: true,
+      stream_options: { include_usage: true },
+    } as OpenAI.Chat.ChatCompletionCreateParamsStreaming);
+  } catch (err) {
+    // 部分 OpenAI 兼容服务不支持 stream_options，去掉后重试一次
+    if ((err as { status?: number }).status === 400) {
+      return await client.chat.completions.create({
+        ...base,
+        stream: true,
+      } as OpenAI.Chat.ChatCompletionCreateParamsStreaming);
+    }
+    throw err;
+  }
+}
+
+function parseToolCalls(raw: OpenAI.Chat.ChatCompletionMessageToolCall[]): ToolCall[] {
+  return raw
     .filter(c => c.type === 'function')
     .map(c => {
       const fn = (c as { id: string; function: { name: string; arguments: string } }).function;
@@ -88,12 +175,14 @@ export async function chatCompletion(
       }
       return { id: c.id, type: 'function', function: { name: fn.name, args } };
     });
+}
 
-  return {
-    content: msg?.content ? stripThink(msg.content) : null,
-    toolCalls,
-    finishReason: res.choices[0]?.finish_reason,
-    promptTokens: res.usage?.prompt_tokens,
-    completionTokens: res.usage?.completion_tokens,
-  };
+function toResult(
+  content: string | null,
+  toolCalls: ToolCall[],
+  finishReason?: string,
+  promptTokens?: number,
+  completionTokens?: number,
+): LlmResult {
+  return { content, toolCalls, finishReason, promptTokens, completionTokens };
 }

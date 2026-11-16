@@ -1,10 +1,13 @@
-import { spawnSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
 import { htmlToMarkdown, extractTitle } from './html.js';
 import { readManifest, saveManifest } from './manifest.js';
 import { slugify, uniqueDest } from '../util.js';
 import type { SourceMeta, WooyaConfig } from '../types.js';
+
+const execFileP = promisify(execFile);
 
 const REPO_PATTERN = /github\.com\/([^/\s]+)\/([^/\s#?]+)/i;
 
@@ -17,12 +20,16 @@ export function detectKind(target: string): SourceKind {
   throw new Error(`无法识别目标：${target}（支持：本地文件路径、GitHub 仓库 URL、网页 URL）`);
 }
 
-function git(args: string[], cwd?: string): string {
-  const r = spawnSync('git', args, { encoding: 'utf8', cwd });
-  if (r.error || r.status !== 0) {
-    throw new Error(`git ${args[0]} 失败：${((r.stderr || '') + (r.stdout || '')).trim().slice(0, 300)}`);
+// 异步执行：git clone 可能长达数分钟，同步 spawn 会阻塞事件循环，令 spinner 停摆
+async function git(args: string[], cwd?: string): Promise<string> {
+  try {
+    const { stdout } = await execFileP('git', args, { cwd, maxBuffer: 10 * 1024 * 1024 });
+    return stdout.trim();
+  } catch (err) {
+    const e = err as { stderr?: string; stdout?: string; message?: string };
+    const detail = ((e.stderr || '') + (e.stdout || '')).trim().slice(0, 300) || e.message || String(err);
+    throw new Error(`git ${args[0]} 失败：${detail}`);
   }
-  return r.stdout.trim();
 }
 
 function toRel(cfg: WooyaConfig, abs: string): string {
@@ -63,8 +70,8 @@ export async function addSource(cfg: WooyaConfig, rawTarget: string): Promise<st
     if (fs.existsSync(dest)) {
       throw new Error(`目录已存在：sources/${slug}，请先处理冲突`);
     }
-    git(['clone', '--depth', '1', target, dest]);
-    const sha = git(['rev-parse', 'HEAD'], dest);
+    await git(['clone', '--depth', '1', target, dest]);
+    const sha = await git(['rev-parse', 'HEAD'], dest);
     meta = { id: slug, type: 'repo', origin: target, title: repoName, ingestedAt: now, sha, path: slug };
   } else {
     const res = await fetch(target, { signal: AbortSignal.timeout(30_000) });

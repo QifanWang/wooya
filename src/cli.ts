@@ -10,6 +10,8 @@ import { DEFAULT_SYSTEM_PROMPT } from './agent/prompts.js';
 import { addSource } from './ingest/index.js';
 import { readManifest } from './ingest/manifest.js';
 import { buildLearnArchive, finishLearn, startLearn, writeLearnArchive } from './learn.js';
+import { attachHintBar, THINK_MODES, withSpinner, type HintBar, type ThinkMode } from './ui.js';
+import { commandCandidates, makeCompleter } from './slash-commands.js';
 import type { SessionState, WooyaConfig } from './types.js';
 
 const HELP = `Wooya — 本地学习资料 agent
@@ -31,13 +33,17 @@ const HELP = `Wooya — 本地学习资料 agent
                     查看当前 provider 的模型列表并切换；--save 写入 .wooya/config.json 作为默认
   /learn <概念>     进入苏格拉底问答
   /end              结束当前学习问答并存档
+  /think [模式]     思考过程展示：collapsed（折叠，默认）/ dim（灰色实时）/ hide（隐藏）
   /clear            清空会话
   /help             查看命令
   /exit             退出
 
 配置：
   API provider 通过 /provider 登记（key 存 ~/.wooya/providers.json），
-  模型通过 /model 切换；数据目录 .wooya/config.json 可绑定 provider 与默认模型`;
+  模型通过 /model 切换；数据目录 .wooya/config.json 可绑定 provider 与默认模型
+
+提示：会话内输入 / 时下方实时显示候选命令；Tab 补全（多候选双击 Tab 列表）；
+  启动时可用 --think=dim|collapsed|hide 指定思考展示。`;
 
 function handleSlash(
   cfg: WooyaConfig,
@@ -45,6 +51,7 @@ function handleSlash(
   line: string,
   tools: ReturnType<typeof buildTools>,
   ask: (q: string) => Promise<string>,
+  spinnerEnabled: boolean,
 ): Promise<'handled' | 'exit' | 'unhandled'> {
   return (async () => {
     if (line === '/exit' || line === '/quit') return 'exit';
@@ -250,7 +257,9 @@ function handleSlash(
     if (line.startsWith('/add')) {
       const target = line.slice(4).trim();
       if (!target) { console.log('用法：/add <url|repo|file>'); return 'handled'; }
-      try { console.log(await addSource(cfg, target)); }
+      try {
+        console.log(await withSpinner(spinnerEnabled, `收录中：${target} …`, () => addSource(cfg, target)));
+      }
       catch (err) { console.log(`收录失败：${err instanceof Error ? err.message : String(err)}`); }
       return 'handled';
     }
@@ -280,10 +289,14 @@ function handleSlash(
   })();
 }
 
-async function repl(cfg: WooyaConfig, verbose: boolean): Promise<void> {
+async function repl(cfg: WooyaConfig, verbose: boolean, thinkMode: ThinkMode): Promise<void> {
   const tools = buildTools(cfg);
   const session = newSession(DEFAULT_SYSTEM_PROMPT);
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    completer: makeCompleter(cfg),
+  });
   let closed = false;
   const lineQueue: string[] = [];
   let notify: (() => void) | null = null;
@@ -308,43 +321,105 @@ async function repl(cfg: WooyaConfig, verbose: boolean): Promise<void> {
         return;
       }
       notify = () => res(lineQueue.length > 0 ? lineQueue.shift()! : '');
-      process.stdout.write(q);
+      promptLen = q.length;
+      // 用 readline 接管提示符：rl 内部必须知道真实提示符长度，否则其全量重绘
+      // （Tab 后、历史切换等）会按默认 '> ' 重画并错位，与提示条的光标恢复互相打架
+      rl.setPrompt(q);
+      rl.prompt();
+      hintBar?.render();
     });
   const showPrompt = () => ask(session.mode === 'learn' ? 'learn> ' : 'wooya> ');
 
+  // 输入行下方实时候选提示（提示词写出后立即渲染一次）
+  let promptLen = 0;
+  let hintBar: HintBar | null = null;
+  hintBar = attachHintBar(rl, {
+    // 不做 startsWith('/') 门控：空提示符也要显示顶层命令，否则初始渲染永远为空
+    getCandidates: line => commandCandidates(cfg, line),
+    getPromptLength: () => promptLen,
+  });
+
+  // 流式渲染：可见输出（正文 / 灰色思考 / 折叠标记）直接落终端
+  let printed = 0;
+  let answerPrinted = 0;
+  const render = (t: string): void => {
+    printed += t.length;
+    process.stdout.write(t);
+  };
+
   console.log(`Wooya 已就绪 · 资料库 ${cfg.sourcesDir} · 模型 ${cfg.model}`);
   if (!cfg.apiKey) console.log('提示：尚未配置 API key，请先运行 /provider add <name> <base-url> 登记并启用 provider。');
-  console.log('输入 /help 查看命令，/exit 退出。\n');
+  console.log('输入 /help 查看命令，输入 / 可见候选提示，Tab 补全，/exit 退出。\n');
 
   for (;;) {
     const line = (await showPrompt()).trim();
     if (closed) break;
     if (!line) continue;
-    const slash = await handleSlash(cfg, session, line, tools, ask);
+    if (line === '/think' || line.startsWith('/think ')) {
+      const mode = line.slice(6).trim();
+      if (!mode || !THINK_MODES.includes(mode as ThinkMode)) {
+        console.log(`当前思考展示：${thinkMode}。用法：/think ${THINK_MODES.join('|')}`);
+      } else {
+        thinkMode = mode as ThinkMode;
+        console.log(`思考展示已切换：${thinkMode}`);
+      }
+      continue;
+    }
+    const slash = await handleSlash(cfg, session, line, tools, ask, process.stdout.isTTY === true && !verbose);
     if (slash === 'exit') break;
     if (slash === 'handled') continue;
+    if (line.startsWith('/')) {
+      console.log(`未识别的命令：${line.split(/\s+/)[0]}（输入 /help 查看可用命令）`);
+      continue;
+    }
     try {
-      const answer = await runAgentTurn(cfg, session, tools, line, verbose);
-      console.log(`\n${answer}\n`);
+      printed = 0;
+      answerPrinted = 0;
+      const answer = await runAgentTurn(cfg, session, tools, line, verbose, {
+        thinkMode,
+        onDelta: render,
+        onAnswerDelta: t => {
+          answerPrinted += t.length;
+        },
+      });
       session.learn?.transcript.push(
         { speaker: 'user', text: line },
         { speaker: 'agent', text: answer },
       );
+      if (answerPrinted > 0) {
+        process.stdout.write('\n\n');
+      } else {
+        // 正文全部为思考段（或模型未流式返回正文）时回退为整体打印
+        console.log(`\n${answer}\n`);
+      }
     } catch (err) {
       console.log(`出错：${err instanceof Error ? err.message : String(err)}`);
     }
   }
+  hintBar.detach();
   rl.close();
 }
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const verbose = argv.includes('--verbose') || argv.includes('-v');
-  const args = argv.filter(a => a !== '--verbose' && a !== '-v');
+  const thinkFlag = argv.find(a => a.startsWith('--think='));
+  const thinkArg = thinkFlag?.slice('--think='.length);
+  let thinkMode: ThinkMode = 'collapsed';
+  if (thinkArg !== undefined) {
+    if (THINK_MODES.includes(thinkArg as ThinkMode)) {
+      thinkMode = thinkArg as ThinkMode;
+    } else {
+      console.error(`无效的 --think 值：${thinkArg}（可选：${THINK_MODES.join('|')}）`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+  const args = argv.filter(a => a !== '--verbose' && a !== '-v' && !a.startsWith('--think='));
   const cmd = args[0];
 
   if (!cmd || cmd === 'repl') {
-    await repl(loadConfig(), verbose);
+    await repl(loadConfig(), verbose, thinkMode);
     return;
   }
   if (cmd === 'init') {
@@ -357,13 +432,27 @@ async function main(): Promise<void> {
     if (!question) { console.error('用法：wooya ask "<问题>"'); process.exitCode = 1; return; }
     const cfg = loadConfig();
     const session = newSession(DEFAULT_SYSTEM_PROMPT);
-    console.log(await runAgentTurn(cfg, session, buildTools(cfg), question, verbose));
+    let printed = 0;
+    let answerPrinted = 0;
+    const answer = await runAgentTurn(cfg, session, buildTools(cfg), question, verbose, {
+      thinkMode,
+      onDelta: t => {
+        printed += t.length;
+        process.stdout.write(t);
+      },
+      onAnswerDelta: t => {
+        answerPrinted += t.length;
+      },
+    });
+    if (answerPrinted > 0) process.stdout.write('\n');
+    else console.log(answer);
     return;
   }
   if (cmd === 'add') {
     const target = args[1];
     if (!target) { console.error('用法：wooya add <url|repo|file>'); process.exitCode = 1; return; }
-    console.log(await addSource(loadConfig(), target));
+    const spinnerEnabled = process.stdout.isTTY === true;
+    console.log(await withSpinner(spinnerEnabled, `收录中：${target} …`, () => addSource(loadConfig(), target)));
     return;
   }
   if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
